@@ -1297,11 +1297,9 @@ VIOSockReadDequeueCb(
     PVIOSOCK_RX_CB  pCurrentCb;
     LIST_ENTRY      LoopbackList, *pCurrentItem;
     ULONG           FreeSpace;
-    BOOLEAN         bSetBit, bStop = FALSE, bRequeue = FALSE;
+    BOOLEAN         bSetBit, bStop = FALSE, bRequeue = FALSE, bRestart = TRUE, bAlwaysTrue = TRUE;
     PVIOSOCK_RX_CONTEXT pRequest = NULL;
     LONGLONG llTimeout = 0;
-    BOOLEAN bRestart = TRUE;
-
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_READ, "--> %s\n", __FUNCTION__);
 
@@ -1421,10 +1419,9 @@ VIOSockReadDequeueCb(
 
             if (!(pRequest->Flags & MSG_PEEK))
             {
-                PLIST_ENTRY pPrevItem = pCurrentItem->Blink;
 
-                RemoveEntryList(pCurrentItem);
-                pCurrentItem = pPrevItem;
+                pCurrentItem = pCurrentItem->Blink;
+                RemoveEntryList(&pCurrentCb->ListEntry);
 
                 pCurrentCb->BytesToRead = 0;
 
@@ -1442,6 +1439,7 @@ VIOSockReadDequeueCb(
                         ASSERT(status == STATUS_CANCELLED);
                         TraceEvents(TRACE_LEVEL_WARNING, DBG_READ, "Loopback request is canceling: 0x%x\n", status);
                         status = STATUS_SUCCESS;
+                        InitializeListHead(&pCurrentCb->ListEntry);//cancellation routine removes element from the list
                     }
                 }
                 else
@@ -1463,7 +1461,6 @@ VIOSockReadDequeueCb(
                 pCurrentCb->ReadPtr += pRequest->FreeBytes;
                 pCurrentCb->BytesToRead -= pRequest->FreeBytes;
                 VIOSockRxPktDec(pSocket, pRequest->FreeBytes);
-
             }
 
             break;
@@ -1518,15 +1515,19 @@ VIOSockReadDequeueCb(
     }
 
     //complete loopback requests (succeed and canceled)
-    while (!IsListEmpty(&LoopbackList))
+    __analysis_assume(bAlwaysTrue == FALSE);
+    if (bAlwaysTrue)
     {
-        pCurrentCb = CONTAINING_RECORD(RemoveHeadList(&LoopbackList), VIOSOCK_RX_CB, ListEntry);
+        while (!IsListEmpty(&LoopbackList))
+        {
+            pCurrentCb = CONTAINING_RECORD(RemoveHeadList(&LoopbackList), VIOSOCK_RX_CB, ListEntry);
 
-        //NOTE! SDV thinks we are completing INVALID request marked as cancelable,
-        //but request is appeared in this list only if WdfRequestMarkCancelableEx failed
-        WdfRequestCompleteWithInformation(pCurrentCb->Request,
-            pCurrentCb->DataLen ? STATUS_SUCCESS : STATUS_CANCELLED,
-            pCurrentCb->DataLen);
+            //NOTE! SDV thinks we are completing INVALID request marked as cancelable,
+            //but request is appeared in this list only if WdfRequestMarkCancelableEx failed
+            WdfRequestCompleteWithInformation(pCurrentCb->Request,
+                pCurrentCb->DataLen ? STATUS_SUCCESS : STATUS_CANCELLED,
+                pCurrentCb->DataLen);
+        }
     }
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_READ, "<-- %s\n", __FUNCTION__);
@@ -1543,6 +1544,7 @@ VIOSockReadCleanupCb(
     PDEVICE_CONTEXT pContext = GetDeviceContextFromSocket(pSocket);
     PVIOSOCK_RX_CB  pCurrentCb;
     LIST_ENTRY      LoopbackList;
+    BOOLEAN         bAlwaysTrue = TRUE;
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_READ, "--> %s\n", __FUNCTION__);
 
@@ -1563,6 +1565,7 @@ VIOSockReadCleanupCb(
             {
                 ASSERT(status == STATUS_CANCELLED);
                 TraceEvents(TRACE_LEVEL_WARNING, DBG_READ, "Loopback request canceled\n");
+                InitializeListHead(&pCurrentCb->ListEntry);//cancellation routine removes element from the list
             }
             else
                 InsertTailList(&LoopbackList, &pCurrentCb->ListEntry); //complete loopback requests later
@@ -1574,10 +1577,14 @@ VIOSockReadCleanupCb(
     WdfSpinLockRelease(pSocket->RxLock);
 
     //complete loopback
-    while (!IsListEmpty(&LoopbackList))
+    __analysis_assume(bAlwaysTrue == FALSE);
+    if (bAlwaysTrue)
     {
-        pCurrentCb = CONTAINING_RECORD(RemoveHeadList(&LoopbackList), VIOSOCK_RX_CB, ListEntry);
-        WdfRequestComplete(pCurrentCb->Request, STATUS_CANCELLED);
+        while (!IsListEmpty(&LoopbackList))
+        {
+            pCurrentCb = CONTAINING_RECORD(RemoveHeadList(&LoopbackList), VIOSOCK_RX_CB, ListEntry);
+            WdfRequestComplete(pCurrentCb->Request, STATUS_CANCELLED);
+        }
     }
 
 }

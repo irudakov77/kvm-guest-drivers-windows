@@ -508,6 +508,7 @@ VIOSockTxDequeue(
             {
                 ASSERT(status == STATUS_CANCELLED);
                 TraceEvents(TRACE_LEVEL_WARNING, DBG_WRITE, "Write request canceled\n");
+                InitializeListHead(&pTxEntry->ListEntry);//cancellation routine removes element from the list
             }
         }
         else
@@ -557,7 +558,7 @@ VIOSockTxDequeue(
 
 _Requires_lock_not_held_(pContext->TxLock)
 VOID
-VIOSockTxCancel(
+VIOSockTxCleanup(
     PDEVICE_CONTEXT pContext,
     WDFFILEOBJECT   Socket,
     NTSTATUS        Status
@@ -566,7 +567,7 @@ VIOSockTxCancel(
     LONG lCnt = 0;
     PLIST_ENTRY CurrentEntry;
     LIST_ENTRY  CompletionList;
-    BOOLEAN     bProcessVq = FALSE;
+    BOOLEAN     bProcessVq = FALSE, bAlwaysTrue = TRUE;
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_WRITE, "--> %s\n", __FUNCTION__);
 
@@ -583,9 +584,15 @@ VIOSockTxCancel(
 
         if (Socket == WDF_NO_HANDLE || pTxEntry->Socket == Socket)
         {
-            CurrentEntry = CurrentEntry->Blink;
+            if (pTxEntry->Request)
+            {
+                if (!NT_SUCCESS(WdfRequestUnmarkCancelable(pTxEntry->Request)))
+                    continue;
+            }
 
+            CurrentEntry = CurrentEntry->Blink;
             RemoveEntryList(&pTxEntry->ListEntry);
+
             InsertTailList(&CompletionList, &pTxEntry->ListEntry); //complete later
 
             if (pTxEntry->Timeout)
@@ -606,16 +613,20 @@ VIOSockTxCancel(
 
     WdfSpinLockRelease(pContext->TxLock);
 
-    while (!IsListEmpty(&CompletionList))
+    __analysis_assume(bAlwaysTrue == FALSE);
+    if (bAlwaysTrue)
     {
-        PVIOSOCK_TX_ENTRY   pTxEntry = CONTAINING_RECORD(RemoveHeadList(&CompletionList),
-            VIOSOCK_TX_ENTRY, ListEntry);
+        while (!IsListEmpty(&CompletionList))
+        {
+            PVIOSOCK_TX_ENTRY pTxEntry = CONTAINING_RECORD(RemoveHeadList(&CompletionList),
+                VIOSOCK_TX_ENTRY, ListEntry);
 
-        if (pTxEntry->Request)
-            WdfRequestComplete(pTxEntry->Request, Status);
+            if (pTxEntry->Request)
+                WdfRequestComplete(pTxEntry->Request, Status);
 
-        if (pTxEntry->Memory)
-            WdfObjectDelete(pTxEntry->Memory);
+            if (pTxEntry->Memory)
+                WdfObjectDelete(pTxEntry->Memory);
+        }
     }
 
     if (bProcessVq)
@@ -946,7 +957,7 @@ VIOSockWriteIoSuspend(
     //stop handling write requests and cleanup queue
     WdfIoQueuePurge(pContext->WriteQueue, NULL, WDF_NO_HANDLE);
 
-    VIOSockTxCancel(pContext, WDF_NO_HANDLE, STATUS_INVALID_DEVICE_STATE);
+    VIOSockTxCleanup(pContext, WDF_NO_HANDLE, STATUS_INVALID_DEVICE_STATE);
 }
 
 VOID
@@ -1017,7 +1028,7 @@ VIOSockTxTimerFunc(
     PLIST_ENTRY CurrentEntry;
     LONGLONG Timeout = LONGLONG_MAX;
     LIST_ENTRY CompletionList;
-    BOOLEAN SetTimer = FALSE;
+    BOOLEAN SetTimer = FALSE, bAlwaysTrue = TRUE;
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_WRITE, "--> %s\n", __FUNCTION__);
 
@@ -1054,6 +1065,7 @@ VIOSockTxTimerFunc(
                     {
                         ASSERT(status == STATUS_CANCELLED);
                         TraceEvents(TRACE_LEVEL_WARNING, DBG_WRITE, "Write request canceled\n");
+                        InitializeListHead(&pTxEntry->ListEntry);//cancellation routine removes element from the list
                     }
                 }
                 else
@@ -1080,12 +1092,16 @@ VIOSockTxTimerFunc(
 
     WdfSpinLockRelease(pContext->TxLock);
 
-    while (!IsListEmpty(&CompletionList))
+    __analysis_assume(bAlwaysTrue == FALSE);
+    if (bAlwaysTrue)
     {
-        PVIOSOCK_TX_ENTRY pTxEntry = CONTAINING_RECORD(RemoveHeadList(&CompletionList),
-            VIOSOCK_TX_ENTRY, ListEntry);
+        while (!IsListEmpty(&CompletionList))
+        {
+            PVIOSOCK_TX_ENTRY pTxEntry = CONTAINING_RECORD(RemoveHeadList(&CompletionList),
+                VIOSOCK_TX_ENTRY, ListEntry);
 
-        WdfRequestComplete(pTxEntry->Request, STATUS_TIMEOUT);
+            WdfRequestComplete(pTxEntry->Request, STATUS_TIMEOUT);
+        }
     }
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_WRITE, "<-- %s\n", __FUNCTION__);
