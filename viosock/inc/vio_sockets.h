@@ -160,8 +160,12 @@ _Success_(return) __inline BOOL ViosockGetConfig(_Out_ PVIRTIO_VSOCK_CONFIG pCon
 /* Use this as the destination CID in an address when referring to the hypervisor.*/
 #define VMADDR_CID_HYPERVISOR         0
 
-/* Reserved, must not be used. */
-#define VMADDR_CID_RESERVED           1
+/* Use this as the destination CID in an address when referring to the
+ * local communication (loopback).
+ * (This was VMADDR_CID_RESERVED, but even VMCI doesn't use it anymore,
+ * it was a legacy value from an older release).
+ */
+#define VMADDR_CID_LOCAL              1
 
 /* Use this as the destination CID in an address when referring to the host
  * (any process other than the hypervisor).
@@ -178,6 +182,8 @@ typedef struct sockaddr_vm
     USHORT svm_reserved1;
     UINT svm_port; /* Port # in host byte order */
     UINT svm_cid;  /* Address in host byte order */
+    // UCHAR svm_flags;
+    // UCHAR svm_zero[3];
 } SOCKADDR_VM, *PSOCKADDR_VM;
 
 #define IOCTL_VM_SOCKETS_GET_LOCAL_CID _IO(7, 0xb9)
