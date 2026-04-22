@@ -142,8 +142,9 @@ INT WSHGetSockaddrType(_In_reads_bytes_(SockaddrLength) PSOCKADDR Sockaddr,
         return WSAEAFNOSUPPORT;
     }
 
-    SockaddrInfo->AddressInfo = (addr->svm_cid == VMADDR_CID_ANY) ? SockaddrAddressInfoWildcard
-                                                                  : SockaddrAddressInfoNormal;
+    SockaddrInfo->AddressInfo = (addr->svm_cid == VMADDR_CID_ANY)   ? SockaddrAddressInfoWildcard
+                             : (addr->svm_cid == VMADDR_CID_LOCAL) ? SockaddrAddressInfoLoopback
+                                                                   : SockaddrAddressInfoNormal;
 
     SockaddrInfo->EndpointType = (addr->svm_port == VMADDR_PORT_ANY) ? SockaddrEndpointInfoWildcard
                                                                      : SockaddrEndpointInfoNormal;
