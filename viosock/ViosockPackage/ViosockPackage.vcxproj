@@ -42,6 +42,9 @@
     <ProjectReference Include="..\wspsvc\viosockwspsvc.vcxproj">
       <Project>{b8c784b3-7914-4539-b728-f2eae5c9795e}</Project>
     </ProjectReference>
+    <ProjectReference Include="..\wsh\wshviosock.vcxproj">
+      <Project>{ad54fa59-dffd-459e-a5cd-235a4bf969b9}</Project>
+    </ProjectReference>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{3F2854A7-A604-4006-A79B-9EAFC63015B8}</ProjectGuid>
@@ -119,6 +122,12 @@
     <LibFiles Include="..\lib\$(PlatformTarget)\$(ConfigurationName)\viosocklib.pdb">
       <OutLib>viosocklib.pdb</OutLib>
     </LibFiles>
+    <LibFiles Include="..\wsh\$(PlatformTarget)\$(ConfigurationName)\wshviosock.dll">
+      <OutLib>wshviosock.dll</OutLib>
+    </LibFiles>
+    <LibFiles Include="..\wsh\$(PlatformTarget)\$(ConfigurationName)\wshviosock.pdb">
+      <OutLib>wshviosock.pdb</OutLib>
+    </LibFiles>
   </ItemGroup>
   <ItemGroup Condition="'$(Platform)'=='x64'">
     <LibFiles Include="..\lib\x64\$(ConfigurationName)\viosocklib.dll">
@@ -132,6 +141,18 @@
     </LibFiles>
     <LibFiles Include="..\lib\x86\$(ConfigurationName)\viosocklib.pdb">
       <OutLib>viosocklib_x86.pdb</OutLib>
+    </LibFiles>
+    <LibFiles Include="..\wsh\x64\$(ConfigurationName)\wshviosock.dll">
+      <OutLib>wshviosock_x64.dll</OutLib>
+    </LibFiles>
+    <LibFiles Include="..\wsh\x64\$(ConfigurationName)\wshviosock.pdb">
+      <OutLib>wshviosock_x64.pdb</OutLib>
+    </LibFiles>
+    <LibFiles Include="..\wsh\x86\$(ConfigurationName)\wshviosock.dll">
+      <OutLib>wshviosock_x86.dll</OutLib>
+    </LibFiles>
+    <LibFiles Include="..\wsh\x86\$(ConfigurationName)\wshviosock.pdb">
+      <OutLib>wshviosock_x86.pdb</OutLib>
     </LibFiles>
   </ItemGroup>
   <Target Name="CopyLibFiles" BeforeTargets="InfVerif">

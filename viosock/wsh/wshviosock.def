@@ -1,0 +1,24 @@
+
+LIBRARY "wshviosock"
+
+EXPORTS
+
+	InstallProtocol
+	DeinstallProtocol
+
+	WSHEnumProtocols
+	WSHGetSockaddrType
+	WSHGetWildcardSockaddr
+	WSHGetSocketInformation
+	WSHSetSocketInformation
+	WSHGetWSAProtocolInfo
+	WSHIoctl
+	WSHNotify
+	WSHAddressToString
+	WSHStringToAddress
+	WSHGetBroadcastSockaddr
+	WSHGetProviderGuid
+	WSHJoinLeaf
+	WSHOpenSocket
+	WSHOpenSocket2
+	WSHGetWinsockMapping
