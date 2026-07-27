@@ -50,6 +50,7 @@
 
 #include <map>
 #include <string>
+#include <utility>
 
 #include "virtiofs.h"
 #include "fusereq.h"
@@ -163,6 +164,9 @@ struct VIRTFS
     // Maps NodeId to its Nlookup counter.
     std::map<UINT64, UINT64> LookupMap{};
 
+    // Directory buffers are shared by WinFsp dispatcher threads and the
+    // periodic refresh thread. This lock also keeps a file context alive while
+    // the refresh thread is using its FUSE handle.
     SRWLOCK RefreshLock = SRWLOCK_INIT;
     std::map<VIRTFS_FILE_CONTEXT *, VIRTFS_REFRESH_ENTRY> RefreshEntries{};
     HANDLE RefreshStopEvent{NULL};
@@ -200,6 +204,12 @@ struct VIRTFS
 
     VOID LookupMapNewOrIncNode(UINT64 NodeId);
     UINT64 LookupMapPopNode(UINT64 NodeId);
+
+    NTSTATUS StartRefreshThread();
+    VOID StopRefreshThread();
+    VOID RegisterRefresh(VIRTFS_FILE_CONTEXT *FileContext, PCWSTR FileName);
+    VOID UnregisterRefresh(VIRTFS_FILE_CONTEXT *FileContext);
+    VOID RefreshWatchedHandles();
 
     NTSTATUS ReadDirAndIgnoreCaseSearch(const VIRTFS_FILE_CONTEXT *ParentContext,
                                         const char *filename,
@@ -239,6 +249,8 @@ struct VIRTFS
                                   uint32_t flags);
     NTSTATUS SubmitDestroyRequest();
 };
+
+static DWORD WINAPI RefreshThreadProc(PVOID Context);
 
 static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem,
                              PVOID FileContext0,
@@ -332,6 +344,7 @@ VOID VIRTFS::Stop()
         return;
     }
 
+    StopRefreshThread();
     FspFileSystemStopDispatcher(FileSystem);
     FspFileSystemDelete(FileSystem);
     FileSystem = NULL;
@@ -474,6 +487,182 @@ static NTSTATUS GetChangeToken(HANDLE Device, const VIRTFS_FILE_CONTEXT *FileCon
     }
 
     return Status;
+}
+
+NTSTATUS VIRTFS::StartRefreshThread()
+{
+    DBG("Starting change notifier with interval %u second(s)", RefreshIntervalSec);
+
+    RefreshStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (RefreshStopEvent == NULL)
+    {
+        return FspNtStatusFromWin32(GetLastError());
+    }
+
+    RefreshThread = CreateThread(NULL, 0, RefreshThreadProc, this, 0, NULL);
+    if (RefreshThread == NULL)
+    {
+        NTSTATUS Status = FspNtStatusFromWin32(GetLastError());
+        CloseHandle(RefreshStopEvent);
+        RefreshStopEvent = NULL;
+        return Status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+VOID VIRTFS::StopRefreshThread()
+{
+    if (RefreshThread != NULL)
+    {
+        SetEvent(RefreshStopEvent);
+        WaitForSingleObject(RefreshThread, INFINITE);
+        CloseHandle(RefreshThread);
+        RefreshThread = NULL;
+    }
+    if (RefreshStopEvent != NULL)
+    {
+        CloseHandle(RefreshStopEvent);
+        RefreshStopEvent = NULL;
+    }
+
+    AcquireSRWLockExclusive(&RefreshLock);
+    RefreshEntries.clear();
+    ReleaseSRWLockExclusive(&RefreshLock);
+}
+
+VOID VIRTFS::RegisterRefresh(VIRTFS_FILE_CONTEXT *FileContext, PCWSTR FileName)
+{
+    if (!RefreshEnabled)
+    {
+        return;
+    }
+
+    bool LockHeld = false;
+    try
+    {
+        VIRTFS_REFRESH_ENTRY Entry;
+        Entry.FileName = FileName;
+        Entry.ChangeTokenValid = NT_SUCCESS(GetChangeToken(Device, FileContext, &Entry.ChangeToken));
+
+        AcquireSRWLockExclusive(&RefreshLock);
+        LockHeld = true;
+        auto [Iterator, Inserted] = RefreshEntries.emplace(FileContext, std::move(Entry));
+        if (Inserted)
+        {
+            DBG("%s added to refresh watcher: path='%S' nodeid=%I64u fh=%I64u",
+                FileContext->IsDirectory ? "Directory" : "File",
+                Iterator->second.FileName.c_str(),
+                FileContext->NodeId,
+                FileContext->FileHandle);
+        }
+        ReleaseSRWLockExclusive(&RefreshLock);
+        LockHeld = false;
+    }
+    catch (std::bad_alloc &)
+    {
+        if (LockHeld)
+        {
+            ReleaseSRWLockExclusive(&RefreshLock);
+        }
+        DBG("Unable to register directory refresh for '%S'", FileName);
+    }
+}
+
+VOID VIRTFS::UnregisterRefresh(VIRTFS_FILE_CONTEXT *FileContext)
+{
+    if (!RefreshEnabled)
+    {
+        return;
+    }
+
+    AcquireSRWLockExclusive(&RefreshLock);
+    auto Iterator = RefreshEntries.find(FileContext);
+    if (Iterator != RefreshEntries.end())
+    {
+        DBG("%s removed from refresh watcher: path='%S' nodeid=%I64u fh=%I64u",
+            FileContext->IsDirectory ? "Directory" : "File",
+            Iterator->second.FileName.c_str(),
+            FileContext->NodeId,
+            FileContext->FileHandle);
+        RefreshEntries.erase(Iterator);
+    }
+    ReleaseSRWLockExclusive(&RefreshLock);
+}
+
+VOID VIRTFS::RefreshWatchedHandles()
+{
+    AcquireSRWLockExclusive(&RefreshLock);
+
+    for (auto &[FileContext, Entry] : RefreshEntries)
+    {
+        VIRTFS_CHANGE_TOKEN ChangeToken;
+        NTSTATUS Status = GetChangeToken(Device, FileContext, &ChangeToken);
+        if (!NT_SUCCESS(Status))
+        {
+            continue;
+        }
+
+        bool Changed = Entry.ChangeTokenValid &&
+                       !(FileContext->IsDirectory ? DirChangeTokenEqual(Entry.ChangeToken, ChangeToken)
+                                                  : FileChangeTokenEqual(Entry.ChangeToken, ChangeToken));
+
+        if (Changed)
+        {
+            DBG("%s change detected: path='%S' nodeid=%I64u fh=%I64u",
+                FileContext->IsDirectory ? "Directory" : "File",
+                Entry.FileName.c_str(),
+                FileContext->NodeId,
+                FileContext->FileHandle);
+            if (FileContext->IsDirectory)
+            {
+                FspFileSystemDeleteDirectoryBuffer(&FileContext->DirBuffer);
+            }
+
+            alignas(FSP_FSCTL_NOTIFY_INFO) BYTE NotifyInfoBuffer[FIELD_OFFSET(FSP_FSCTL_NOTIFY_INFO, FileNameBuf) +
+                                                                 MAX_PATH * sizeof(WCHAR)];
+            FSP_FSCTL_NOTIFY_INFO *NotifyInfo = reinterpret_cast<FSP_FSCTL_NOTIFY_INFO *>(NotifyInfoBuffer);
+            SIZE_T FileNameLength = min(Entry.FileName.length(), (SIZE_T)MAX_PATH - 1);
+
+            ZeroMemory(NotifyInfoBuffer, sizeof(NotifyInfoBuffer));
+            CopyMemory(NotifyInfo->FileNameBuf, Entry.FileName.c_str(), FileNameLength * sizeof(WCHAR));
+            NotifyInfo->Size = (UINT16)(sizeof(*NotifyInfo) + FileNameLength * sizeof(WCHAR));
+            NotifyInfo->Action = FILE_ACTION_MODIFIED;
+            NotifyInfo->Filter = FileContext->IsDirectory ? FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME
+                                                          : FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+
+            if (STATUS_SUCCESS == FspFileSystemNotifyBegin(FileSystem, 500))
+            {
+                FspFileSystemNotify(FileSystem, NotifyInfo, NotifyInfo->Size);
+                FspFileSystemNotifyEnd(FileSystem);
+            }
+        }
+        else
+        {
+            DBG("No %s change detected: path='%S' nodeid=%I64u fh=%I64u",
+                FileContext->IsDirectory ? "directory" : "file",
+                Entry.FileName.c_str(),
+                FileContext->NodeId,
+                FileContext->FileHandle);
+        }
+
+        Entry.ChangeToken = ChangeToken;
+        Entry.ChangeTokenValid = true;
+    }
+
+    ReleaseSRWLockExclusive(&RefreshLock);
+}
+
+static DWORD WINAPI RefreshThreadProc(PVOID Context)
+{
+    VIRTFS *VirtFs = static_cast<VIRTFS *>(Context);
+
+    while (WAIT_TIMEOUT == WaitForSingleObject(VirtFs->RefreshStopEvent, VirtFs->RefreshIntervalSec * 1000))
+    {
+        VirtFs->RefreshWatchedHandles();
+    }
+
+    return 0;
 }
 
 static UINT32 PosixUnixModeToAttributes(VIRTFS *VirtFs, uint64_t nodeid, uint32_t mode)
@@ -1579,6 +1768,8 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
 
     *PFileContext = FileContext;
 
+    VirtFs->RegisterRefresh(FileContext, FileName);
+
     return Status;
 }
 
@@ -1603,6 +1794,8 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    FileContext->FileHandle = INVALID_FILE_HANDLE;
+
     Status = VirtFsLookupFileName(VirtFs, FileName, &lookup_out);
     if (!NT_SUCCESS(Status))
     {
@@ -1625,6 +1818,11 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
 
     SetFileInfo(VirtFs, &lookup_out.entry, FileInfo);
     *PFileContext = FileContext;
+
+    if (FileContext->FileHandle != INVALID_FILE_HANDLE)
+    {
+        VirtFs->RegisterRefresh(FileContext, FileName);
+    }
 
     return Status;
 }
@@ -1698,7 +1896,12 @@ static VOID Close(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0)
 
     DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
-    (VOID) VirtFs->SubmitReleaseRequest(FileContext);
+    VirtFs->UnregisterRefresh(FileContext);
+
+    if (FileContext->FileHandle != INVALID_FILE_HANDLE)
+    {
+        (VOID) VirtFs->SubmitReleaseRequest(FileContext);
+    }
 
     FspFileSystemDeleteDirectoryBuffer(&FileContext->DirBuffer);
 
@@ -2480,6 +2683,18 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem,
     int FileNameLength;
     FUSE_READ_OUT *read_out;
 
+    bool RefreshLockHeld = VirtFs->RefreshEnabled;
+    if (RefreshLockHeld)
+    {
+        AcquireSRWLockExclusive(&VirtFs->RefreshLock);
+    }
+    scope_exit RefreshLockGuard([VirtFs, RefreshLockHeld] {
+        if (RefreshLockHeld)
+        {
+            ReleaseSRWLockExclusive(&VirtFs->RefreshLock);
+        }
+    });
+
     DBG("Pattern: %S Marker: %S BufferLength: %u",
         Pattern ? Pattern : TEXT("(null)"),
         Marker ? Marker : TEXT("(null)"),
@@ -2497,11 +2712,11 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem,
         {
             for (;;)
             {
-                VirtFs->SubmitReadDirRequest(FileContext,
-                                             Offset,
-                                             TRUE,
-                                             read_out,
-                                             sizeof(struct fuse_out_header) + (ULONG64)BufferLength * 2);
+                Status = VirtFs->SubmitReadDirRequest(FileContext,
+                                                      Offset,
+                                                      TRUE,
+                                                      read_out,
+                                                      sizeof(struct fuse_out_header) + (ULONG64)BufferLength * 2);
 
                 if (!NT_SUCCESS(Status))
                 {
@@ -2881,6 +3096,16 @@ NTSTATUS VIRTFS::Start()
     {
         FspServiceLog(EVENTLOG_ERROR_TYPE, (PWSTR)L"Failed to mount virtio-fs file system.");
         goto out_del_fs;
+    }
+
+    if (RefreshEnabled)
+    {
+        Status = StartRefreshThread();
+        if (!NT_SUCCESS(Status))
+        {
+            FspFileSystemStopDispatcher(FileSystem);
+            goto out_del_fs;
+        }
     }
 
     return STATUS_SUCCESS;
