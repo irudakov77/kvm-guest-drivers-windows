@@ -2896,6 +2896,8 @@ static NTSTATUS ParseArgs(ULONG argc,
                           ULONG &DebugFlags,
                           std::wstring &DebugLogFile,
                           bool &CaseInsensitive,
+                          bool &RefreshEnabled,
+                          ULONG &RefreshIntervalSec,
                           std::wstring &FileSystemName,
                           std::wstring &MountPoint,
                           std::wstring &Tag,
@@ -2933,6 +2935,10 @@ static NTSTATUS ParseArgs(ULONG argc,
                 break;
             case L'i':
                 CaseInsensitive = true;
+                break;
+            case L'n':
+                argtol(RefreshIntervalSec);
+                RefreshEnabled = true;
                 break;
             case L'F':
                 argtos(FileSystemName);
@@ -2973,12 +2979,13 @@ usage:
                              "    -d DebugFlags       [-1: enable all debug logs]\n"
                              "    -D DebugLogFile     [file path; use - for stderr]\n"
                              "    -i                  [case insensitive file system]\n"
+                             "    -n Seconds          [enable notifier; 0 defaults to 3, maximum %u]\n"
                              "    -F FileSystemName   [file system name for OS]\n"
                              "    -m MountPoint       [X:|* (required if no UNC prefix)]\n"
                              "    -t Tag              [mount tag; max 36 symbols]\n"
                              "    -o UID:GID          [host owner UID:GID]\n";
 
-    FspServiceLog(EVENTLOG_ERROR_TYPE, usage, FS_SERVICE_NAME);
+    FspServiceLog(EVENTLOG_ERROR_TYPE, usage, FS_SERVICE_NAME, MAX_REFRESH_INTERVAL_SEC);
 
     return STATUS_UNSUCCESSFUL;
 }
@@ -2986,6 +2993,8 @@ usage:
 static VOID ParseRegistry(ULONG &DebugFlags,
                           std::wstring &DebugLogFile,
                           bool &CaseInsensitive,
+                          bool &RefreshEnabled,
+                          ULONG &RefreshIntervalSec,
                           std::wstring &FileSystemName,
                           std::wstring &MountPoint,
                           std::wstring &Owner)
@@ -2993,6 +3002,8 @@ static VOID ParseRegistry(ULONG &DebugFlags,
     RegistryGetVal(FS_SERVICE_REGKEY, L"DebugFlags", DebugFlags);
     RegistryGetVal(FS_SERVICE_REGKEY, L"DebugLogFile", DebugLogFile);
     RegistryGetVal(FS_SERVICE_REGKEY, L"CaseInsensitive", CaseInsensitive);
+    RegistryGetVal(FS_SERVICE_REGKEY, L"NotifierEnabled", RefreshEnabled);
+    RegistryGetVal(FS_SERVICE_REGKEY, L"NotifierIntervalSec", RefreshIntervalSec);
     RegistryGetVal(FS_SERVICE_REGKEY, L"FileSystemName", FileSystemName);
     RegistryGetVal(FS_SERVICE_REGKEY, L"MountPoint", MountPoint);
     RegistryGetVal(FS_SERVICE_REGKEY, L"Owner", Owner);
@@ -3079,6 +3090,8 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
                            DebugFlags,
                            DebugLogFile,
                            CaseInsensitive,
+                           RefreshEnabled,
+                           RefreshIntervalSec,
                            FileSystemName,
                            MountPoint,
                            Tag,
@@ -3091,7 +3104,14 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     }
     else
     {
-        ParseRegistry(DebugFlags, DebugLogFile, CaseInsensitive, FileSystemName, MountPoint, Owner);
+        ParseRegistry(DebugFlags,
+                      DebugLogFile,
+                      CaseInsensitive,
+                      RefreshEnabled,
+                      RefreshIntervalSec,
+                      FileSystemName,
+                      MountPoint,
+                      Owner);
     }
 
     ParseRegistryCommon();
@@ -3101,6 +3121,15 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     if (!NT_SUCCESS(Status))
     {
         return Status;
+    }
+
+    if (RefreshEnabled && RefreshIntervalSec == 0)
+    {
+        RefreshIntervalSec = DEFAULT_REFRESH_INTERVAL_SEC;
+    }
+    else if (RefreshEnabled && RefreshIntervalSec > MAX_REFRESH_INTERVAL_SEC)
+    {
+        RefreshIntervalSec = MAX_REFRESH_INTERVAL_SEC;
     }
 
     if (!DebugLogFile.empty())
