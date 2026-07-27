@@ -60,6 +60,8 @@
 #define ALLOCATION_UNIT                4096
 #define PAGE_SZ_4K                     4096
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
+#define DEFAULT_REFRESH_INTERVAL_SEC   3
+#define MAX_REFRESH_INTERVAL_SEC       60
 
 #define INVALID_FILE_HANDLE            ((uint64_t)(-1))
 
@@ -103,6 +105,24 @@ typedef struct
 
 } VIRTFS_FILE_CONTEXT, *PVIRTFS_FILE_CONTEXT;
 
+typedef struct VIRTFS_CHANGE_TOKEN
+{
+    UINT64 Atime;
+    UINT64 Mtime;
+    UINT64 Ctime;
+    UINT32 AtimeNsec;
+    UINT32 MtimeNsec;
+    UINT32 CtimeNsec;
+    UINT32 Nlink;
+} VIRTFS_CHANGE_TOKEN;
+
+typedef struct VIRTFS_REFRESH_ENTRY
+{
+    std::wstring FileName;
+    VIRTFS_CHANGE_TOKEN ChangeToken{};
+    bool ChangeTokenValid{false};
+} VIRTFS_REFRESH_ENTRY;
+
 struct VIRTFS
 {
     FSP_FILE_SYSTEM *FileSystem{NULL};
@@ -117,6 +137,8 @@ struct VIRTFS
     DeviceHandleNotification DevHandleNotification{};
 
     bool CaseInsensitive{false};
+    bool RefreshEnabled{false};
+    ULONG RefreshIntervalSec{DEFAULT_REFRESH_INTERVAL_SEC};
     std::wstring FileSystemName{};
     std::wstring MountPoint{L"*"};
     std::wstring Tag{};
@@ -141,16 +163,24 @@ struct VIRTFS
     // Maps NodeId to its Nlookup counter.
     std::map<UINT64, UINT64> LookupMap{};
 
+    SRWLOCK RefreshLock = SRWLOCK_INIT;
+    std::map<VIRTFS_FILE_CONTEXT *, VIRTFS_REFRESH_ENTRY> RefreshEntries{};
+    HANDLE RefreshStopEvent{NULL};
+    HANDLE RefreshThread{NULL};
+
     VIRTFS(ULONG DebugFlags,
            bool CaseInsensitive,
            const std::wstring &FileSystemName,
            const std::wstring &MountPoint,
            const std::wstring &Tag,
+           bool RefreshEnabled,
+           ULONG RefreshIntervalSec,
            bool AutoOwnerIds,
            uint32_t OwnerUid,
            uint32_t OwnerGid)
-        : DebugFlags{DebugFlags}, CaseInsensitive{CaseInsensitive}, FileSystemName{FileSystemName},
-          MountPoint{MountPoint}, Tag{Tag}, AutoOwnerIds{AutoOwnerIds}
+        : DebugFlags{DebugFlags}, CaseInsensitive{CaseInsensitive}, RefreshEnabled{RefreshEnabled},
+          RefreshIntervalSec{RefreshIntervalSec}, FileSystemName{FileSystemName}, MountPoint{MountPoint}, Tag{Tag},
+          AutoOwnerIds{AutoOwnerIds}
     {
         if (!AutoOwnerIds)
         {
@@ -230,6 +260,13 @@ static VOID FixReparsePointAttributes(VIRTFS *VirtFs, uint64_t nodeid, UINT32 *P
 static VOID GetVolumeName(HANDLE Device, PWSTR VolumeName, DWORD VolumeNameSize);
 
 static NTSTATUS VirtFsLookupFileName(VIRTFS *VirtFs, PWSTR FileName, FUSE_LOOKUP_OUT *LookupOut);
+
+static NTSTATUS VirtFsFuseRequest(HANDLE Device,
+                                  LPVOID InBuffer,
+                                  DWORD InBufferSize,
+                                  LPVOID OutBuffer,
+                                  DWORD OutBufferSize,
+                                  DWORD Code = IOCTL_VIRTFS_FUSE_REQUEST);
 
 static DWORD WINAPI DeviceNotificationCallback(HCMNOTIFICATION Notify,
                                                PVOID Context,
@@ -402,6 +439,43 @@ DWORD WINAPI DeviceNotificationCallback(HCMNOTIFICATION Notify,
     return ERROR_SUCCESS;
 }
 
+static bool DirChangeTokenEqual(const VIRTFS_CHANGE_TOKEN &Left, const VIRTFS_CHANGE_TOKEN &Right)
+{
+    return Left.Atime == Right.Atime && Left.Mtime == Right.Mtime && Left.Ctime == Right.Ctime &&
+           Left.AtimeNsec == Right.AtimeNsec && Left.MtimeNsec == Right.MtimeNsec &&
+           Left.CtimeNsec == Right.CtimeNsec && Left.Nlink == Right.Nlink;
+}
+
+static bool FileChangeTokenEqual(const VIRTFS_CHANGE_TOKEN &Left, const VIRTFS_CHANGE_TOKEN &Right)
+{
+    return Left.Mtime == Right.Mtime && Left.MtimeNsec == Right.MtimeNsec;
+}
+
+static NTSTATUS GetChangeToken(HANDLE Device, const VIRTFS_FILE_CONTEXT *FileContext, VIRTFS_CHANGE_TOKEN *ChangeToken)
+{
+    FUSE_GETATTR_IN getattr_in;
+    FUSE_GETATTR_OUT getattr_out;
+
+    FUSE_HEADER_INIT(&getattr_in.hdr, FUSE_GETATTR, FileContext->NodeId, sizeof(getattr_in.getattr));
+    ZeroMemory(&getattr_in.getattr, sizeof(getattr_in.getattr));
+    getattr_in.getattr.fh = FileContext->FileHandle;
+    getattr_in.getattr.getattr_flags = FUSE_GETATTR_FH;
+
+    NTSTATUS Status = VirtFsFuseRequest(Device, &getattr_in, sizeof(getattr_in), &getattr_out, sizeof(getattr_out));
+    if (NT_SUCCESS(Status))
+    {
+        ChangeToken->Atime = getattr_out.attr.attr.atime;
+        ChangeToken->Mtime = getattr_out.attr.attr.mtime;
+        ChangeToken->Ctime = getattr_out.attr.attr.ctime;
+        ChangeToken->AtimeNsec = getattr_out.attr.attr.atimensec;
+        ChangeToken->MtimeNsec = getattr_out.attr.attr.mtimensec;
+        ChangeToken->CtimeNsec = getattr_out.attr.attr.ctimensec;
+        ChangeToken->Nlink = getattr_out.attr.attr.nlink;
+    }
+
+    return Status;
+}
+
 static UINT32 PosixUnixModeToAttributes(VIRTFS *VirtFs, uint64_t nodeid, uint32_t mode)
 {
     UINT32 Attributes;
@@ -562,7 +636,7 @@ static NTSTATUS VirtFsFuseRequest(HANDLE Device,
                                   DWORD InBufferSize,
                                   LPVOID OutBuffer,
                                   DWORD OutBufferSize,
-                                  DWORD Code = IOCTL_VIRTFS_FUSE_REQUEST)
+                                  DWORD Code)
 {
     NTSTATUS Status = STATUS_SUCCESS;
     DWORD BytesReturned = 0;
@@ -2968,6 +3042,8 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     std::wstring DebugLogFile{};
     ULONG DebugFlags{0};
     bool CaseInsensitive{false};
+    bool RefreshEnabled{false};
+    ULONG RefreshIntervalSec{DEFAULT_REFRESH_INTERVAL_SEC};
     std::wstring MountPoint{L"*"};
     std::wstring FileSystemName{};
     std::wstring Tag{};
@@ -3043,6 +3119,8 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
                             FileSystemName,
                             MountPoint,
                             Tag,
+                            RefreshEnabled,
+                            RefreshIntervalSec,
                             AutoOwnerIds,
                             OwnerUid,
                             OwnerGid);
