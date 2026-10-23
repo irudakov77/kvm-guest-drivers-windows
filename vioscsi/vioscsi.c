@@ -1015,7 +1015,11 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
                NULL)
         {
             PVirtIOSCSIEvent evt = &evtNode->event;
-            switch (evt->event)
+            if (evt->event & VIRTIO_SCSI_T_EVENTS_MISSED)
+            {
+                StorPortNotification(BusChangeDetected, DeviceExtension, 0);
+            }
+            switch (evt->event & ~VIRTIO_SCSI_T_EVENTS_MISSED)
             {
                 case VIRTIO_SCSI_T_NO_EVENT:
                     break;
@@ -1103,7 +1107,11 @@ static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG Messa
                NULL)
         {
             PVirtIOSCSIEvent evt = &evtNode->event;
-            switch (evt->event)
+            if (evt->event & VIRTIO_SCSI_T_EVENTS_MISSED)
+            {
+                StorPortNotification(BusChangeDetected, DeviceExtension, 0);
+            }
+            switch (evt->event & ~VIRTIO_SCSI_T_EVENTS_MISSED)
             {
                 case VIRTIO_SCSI_T_NO_EVENT:
                     break;
